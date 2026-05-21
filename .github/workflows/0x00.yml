@@ -1,0 +1,377 @@
+name: 0x00 dl (with WARP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'لینک(های) یوتیوب، اینستاگرام یا هر سایت دیگر (با فاصله یا کاما جدا کنید)'
+        required: true
+        type: string
+      quality:
+        description: 'کیفیت ویدیو (عدد / best / audio)'
+        required: true
+        type: choice
+        options:
+          - 'best'
+          - '2160'
+          - '1440'
+          - '1080'
+          - '720'
+          - '480'
+          - 'audio'
+      audio_bitrate:
+        description: 'نرخ بیت صدا (فقط برای audio)'
+        required: false
+        type: choice
+        options:
+          - '64k'
+          - '128k'
+          - '192k'
+          - '256k'
+          - '320k'
+          - 'Best'
+        default: '128k'
+      video_format:
+        description: 'فرمت ویدیو (برای کیفیت غیر audio) - برای "best" این گزینه نادیده گرفته می‌شود'
+        required: false
+        type: choice
+        options:
+          - 'mp4'
+          - 'mkv'
+          - 'webm'
+          - 'best (بدون محدودیت)'
+        default: 'best (بدون محدودیت)'
+      playlist_start:
+        description: 'شروع پلی‌لیست (یوتیوب)'
+        required: false
+        type: string
+        default: ''
+      playlist_end:
+        description: 'پایان پلی‌لیست (یوتیوب)'
+        required: false
+        type: string
+        default: ''
+      password:
+        description: 'رمز ZIP (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      split_size_mb:
+        description: 'حداکثر حجم هر قطعه ZIP برای فایل‌های بزرگ (مگابایت) - پیش‌فرض 20 برای بله'
+        required: false
+        type: string
+        default: '20'
+
+jobs:
+  download-and-save:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git for large files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Start WARP Container
+        run: |
+          docker network create warp-net || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          echo "Waiting for WARP to initialize (15s)..."
+          sleep 15
+          curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp || echo "WARP may not be ready"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2 jq bc
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          pip install yt-dlp
+
+      - name: Setup Cookies
+        env:
+          IG_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
+          MISC_COOKIES: ${{ secrets.MISC_COOKIES }}
+        run: |
+          echo "$IG_COOKIES" > instagram_cookies.txt
+          echo "$MISC_COOKIES" > misc_cookies.txt
+
+      - name: Download and process (with fallback to WARP)
+        shell: bash
+        run: |
+          set -e
+          URLS="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          BITRATE="${{ github.event.inputs.audio_bitrate }}"
+          VFMT="${{ github.event.inputs.video_format }}"
+          START="${{ github.event.inputs.playlist_start }}"
+          END="${{ github.event.inputs.playlist_end }}"
+
+          IFS=', ' read -ra URL_ARRAY <<< "$URLS"
+          mkdir -p tmp_dl dl thumb
+          > metadata_raw.txt
+          > new_files.txt
+
+          if [ "$QUALITY" = "audio" ]; then
+            FORMAT="bestaudio/bestaudio*"
+            EXTRA_FLAGS="-x --audio-format mp3 --audio-quality 0"
+          elif [ "$QUALITY" = "best" ]; then
+            FORMAT="bestvideo+bestaudio"
+            EXTRA_FLAGS="--merge-output-format mp4"
+            if [[ "$VFMT" != "best (بدون محدودیت)" ]]; then
+              EXTRA_FLAGS="--merge-output-format $VFMT"
+            fi
+          else
+            if [[ "$VFMT" == "best (بدون محدودیت)" ]]; then
+              FORMAT="bestvideo[height=$QUALITY]+bestaudio/bestvideo[height<=$QUALITY]+bestaudio/bestvideo[height=$QUALITY]*+bestaudio*/bestvideo[height<=$QUALITY]*+bestaudio*"
+              EXTRA_FLAGS="--merge-output-format mp4"
+            else
+              FORMAT="bestvideo[height=$QUALITY][ext=$VFMT]+bestaudio[ext=m4a]/best[ext=$VFMT][height=$QUALITY]/best[ext=$VFMT][height<=$QUALITY]"
+              EXTRA_FLAGS="--merge-output-format $VFMT"
+            fi
+          fi
+
+          COMMON_OPTS="--no-cache-dir --no-part --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
+          PROXY_FLAG="--proxy socks5://127.0.0.1:1080"
+
+          for URL in "${URL_ARRAY[@]}"; do
+            echo "Processing: $URL"
+
+            if [[ "$URL" == *"instagram.com"* || "$URL" == *"instagr.am"* ]]; then
+              echo "Instagram mode"
+              [ -s instagram_cookies.txt ] && COOKIE="--cookies instagram_cookies.txt" || COOKIE=""
+              SUCCESS=false
+              if [ -n "$COOKIE" ]; then
+                yt-dlp $COOKIE $EXTRA_FLAGS $COMMON_OPTS --write-thumbnail --convert-thumbnail jpg -o 'tmp_dl/%(title)s.%(ext)s' "$URL" && SUCCESS=true
+              fi
+              if [ "$SUCCESS" = false ]; then
+                yt-dlp $PROXY_FLAG $EXTRA_FLAGS $COMMON_OPTS --write-thumbnail --convert-thumbnail jpg -o 'tmp_dl/%(title)s.%(ext)s' "$URL" && SUCCESS=true
+              fi
+            elif [[ "$URL" == *"youtube.com"* || "$URL" == *"youtu.be"* ]]; then
+              echo "YouTube mode"
+              PLAYLIST_OPTS=""
+              [ -n "$START" ] && PLAYLIST_OPTS="$PLAYLIST_OPTS --playlist-start $START"
+              [ -n "$END" ] && PLAYLIST_OPTS="$PLAYLIST_OPTS --playlist-end $END"
+              METHODS=(
+                "$PROXY_FLAG --extractor-args youtube:player_client=web --js-runtimes deno --remote-components ejs:github"
+                "$PROXY_FLAG --extractor-args youtube:player_client=web,mweb,android_vr --js-runtimes deno --remote-components ejs:github"
+                "--extractor-args youtube:player_client=web --js-runtimes deno --remote-components ejs:github"
+                "--extractor-args youtube:player_client=mweb"
+              )
+              SUCCESS=false
+              for METHOD_ARGS in "${METHODS[@]}"; do
+                CMD="yt-dlp --format \"$FORMAT\" $EXTRA_FLAGS $COMMON_OPTS $METHOD_ARGS $PLAYLIST_OPTS --write-thumbnail --convert-thumbnail jpg -o 'tmp_dl/%(title)s.%(ext)s' '$URL'"
+                if eval $CMD; then
+                  # Quality check for numeric qualities
+                  if [[ "$QUALITY" =~ ^[0-9]+$ ]] && [ -n "$(find tmp_dl -name '*.mp4' -o -name '*.mkv' -o -name '*.webm' 2>/dev/null)" ]; then
+                    VIDEO_FILE=$(find tmp_dl -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | head -1)
+                    if [ -n "$VIDEO_FILE" ]; then
+                      ACTUAL_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$VIDEO_FILE" 2>/dev/null || echo "0")
+                      if [ "$ACTUAL_HEIGHT" -lt $((QUALITY - 50)) ] 2>/dev/null; then
+                        echo "Quality check failed: expected ${QUALITY}p, got ${ACTUAL_HEIGHT}p. Rejecting."
+                        rm -f "$VIDEO_FILE"
+                        continue
+                      fi
+                    fi
+                  fi
+                  SUCCESS=true
+                  break
+                fi
+                sleep 2
+              done
+            else
+              echo "Generic site mode"
+              [ -s misc_cookies.txt ] && COOKIE="--cookies misc_cookies.txt" || COOKIE=""
+              SUCCESS=false
+              if [ -n "$COOKIE" ]; then
+                yt-dlp $COOKIE $EXTRA_FLAGS $COMMON_OPTS --write-thumbnail --convert-thumbnail jpg -o 'tmp_dl/%(title)s.%(ext)s' "$URL" && SUCCESS=true
+              fi
+              if [ "$SUCCESS" = false ]; then
+                yt-dlp $PROXY_FLAG $EXTRA_FLAGS $COMMON_OPTS --write-thumbnail --convert-thumbnail jpg -o 'tmp_dl/%(title)s.%(ext)s' "$URL" && SUCCESS=true
+              fi
+            fi
+
+            if [ "$SUCCESS" = false ]; then
+              echo "All methods failed for $URL, skipping."
+              continue
+            fi
+
+            THUMB_SRC=$(find tmp_dl -maxdepth 1 -name "*.jpg" -print -quit)
+            MEDIA_FILE=$(find tmp_dl -type f \( -name "*.mp4" -o -name "*.mp3" -o -name "*.webm" -o -name "*.mkv" \) -print -quit)
+            if [ -f "$MEDIA_FILE" ]; then
+              BASENAME=$(basename "$MEDIA_FILE")
+              TITLE="${BASENAME%.*}"
+              SIZE_MB=$(du -m "$MEDIA_FILE" | cut -f1)
+              EXT="${MEDIA_FILE##*.}"
+              FORMAT_LOCAL=$(echo "$EXT" | tr '[:lower:]' '[:upper:]')
+              DUR="NA"
+              DUR_SEC=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$MEDIA_FILE" 2>/dev/null | cut -d. -f1)
+              [[ "$DUR_SEC" =~ ^[0-9]+$ ]] && DUR=$(printf "%02d:%02d" $((DUR_SEC/60)) $((DUR_SEC%60)))
+
+              THUMB_FINAL_NAME=""
+              if [ -f "$THUMB_SRC" ]; then
+                THUMB_FINAL_NAME="${TITLE}.jpg"
+                SAFE_NAME=$(echo "$THUMB_FINAL_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+                mv "$THUMB_SRC" "thumb/$SAFE_NAME"
+                THUMB_FINAL_NAME="$SAFE_NAME"
+              fi
+
+              DATE=$(TZ='Asia/Tehran' date +"%Y-%m-%d %H:%M")
+              echo "$TITLE||$DUR||${SIZE_MB}MB||$THUMB_FINAL_NAME||$FORMAT_LOCAL||$DATE||$BASENAME||$URL" >> metadata_raw.txt
+              mv "$MEDIA_FILE" "dl/$BASENAME"
+              echo "$BASENAME" >> new_files.txt
+            fi
+            rm -rf tmp_dl/*
+          done
+          cp metadata_raw.txt metadata_final.txt
+
+      - name: Zip large files (split into custom size MB parts)
+        shell: bash
+        run: |
+          [ ! -f new_files.txt ] && exit 0
+          HAS_PASS="${{ github.event.inputs.password }}"
+          SPLIT_SIZE="${{ github.event.inputs.split_size_mb }}"
+          if ! [[ "$SPLIT_SIZE" =~ ^[0-9]+$ ]]; then
+            SPLIT_SIZE=20
+          fi
+          echo "Splitting files into ${SPLIT_SIZE}MB parts"
+          while IFS= read -r BASENAME; do
+            FILE="dl/$BASENAME"
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            LIMIT=$((SPLIT_SIZE * 1024 * 1024))
+            if [ -n "$HAS_PASS" ] || [ "$SIZE" -gt "$LIMIT" ]; then
+              BASE="${BASENAME%.*}"
+              PASS_ARG=""; [ -n "$HAS_PASS" ] && PASS_ARG="-P $HAS_PASS"
+              echo "Splitting $BASENAME into ${SPLIT_SIZE}MB parts (zip format)"
+              rm -f "dl/${BASE}.zip" "dl/${BASE}.z"*
+              zip $PASS_ARG -s ${SPLIT_SIZE}m "dl/${BASE}.zip" -j "$FILE" > /dev/null 2>&1
+              rm -f "$FILE"
+              sed -i "/^${BASE}||/d" metadata_final.txt
+              PARTS=()
+              [ -f "dl/${BASE}.zip" ] && PARTS+=("dl/${BASE}.zip")
+              for ZP in dl/${BASE}.z*; do
+                [ -f "$ZP" ] && PARTS+=("$ZP")
+              done
+              IFS=$'\n' PARTS=($(sort <<<"${PARTS[*]}"))
+              PART_NUM=1
+              for PFILE in "${PARTS[@]}"; do
+                ZN=$(basename "$PFILE")
+                SZ=$(du -m "$PFILE" | cut -f1)
+                PART_TITLE="${BASE} - Part ${PART_NUM}"
+                echo "$PART_TITLE||NA||${SZ}MB||❌||ZIP||$(TZ='Asia/Tehran' date +"%Y-%m-%d %H:%M")||$ZN||" >> metadata_final.txt
+                echo "$ZN" >> new_files.txt
+                PART_NUM=$((PART_NUM + 1))
+              done
+            fi
+          done < new_files.txt
+          sort -u new_files.txt -o new_files.txt
+
+      - name: Merge with database and sort
+        run: |
+          touch db.txt
+          cat metadata_final.txt >> db.txt
+          sort -t'|' -k6 -r db.txt > db_temp.txt
+          awk -F'||' '!seen[$1]++' db_temp.txt > db_unique.txt
+          sort -t'|' -k6 -r db_unique.txt > db_sorted.txt
+          mv db_sorted.txt db.txt
+          rm -f db_temp.txt db_unique.txt
+          cp db.txt metadata_final.txt
+          cut -d'|' -f1 db.txt | sed 's/||.*//' > new_files.txt
+
+      - name: Generate Links.md (fixed thumbnail)
+        run: |
+          python3 << 'EOF'
+          import os, urllib.parse, glob, re
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+          password = os.environ.get('PASSWORD', '')
+          rows = []
+          if os.path.exists('db.txt'):
+              with open('db.txt', 'r', encoding='utf-8') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line: continue
+                      parts = line.split('||')
+                      if len(parts) >= 8:
+                          title, dur, size, thumb, fmt, date, fname, src = parts[:8]
+                      elif len(parts) >= 7:
+                          title, dur, size, thumb, fmt, date, fname = parts[:7]
+                          src = ""
+                      else:
+                          continue
+                      encoded = urllib.parse.quote(fname)
+                      raw_url = f"https://github.com/{repo}/raw/{branch}/dl/{encoded}"
+                      
+                      thumb_md = "❌"
+                      # try from db field first
+                      if thumb and thumb != "❌" and os.path.exists(f"thumb/{thumb}"):
+                          thumb_url = f"https://github.com/{repo}/raw/{branch}/thumb/{thumb}"
+                          thumb_md = f'<a href="{thumb_url}" target="_blank"><img src="{thumb_url}" width="800" style="border-radius:8px; border:1px solid #ccc;" /></a>'
+                      else:
+                          # clean the filename (remove extension, replace special chars)
+                          base_title = os.path.splitext(fname)[0]
+                          safe_title = re.sub(r'[^\w\-_.]', '_', base_title)
+                          possible = glob.glob(f"thumb/{safe_title}.jpg")
+                          if not possible:
+                              possible = glob.glob(f"thumb/{safe_title}*.jpg")
+                          if not possible:
+                              possible = glob.glob(f"thumb/{base_title}*.jpg")
+                          if possible:
+                              thumb_url = f"https://github.com/{repo}/raw/{branch}/{possible[0]}"
+                              thumb_md = f'<a href="{thumb_url}" target="_blank"><img src="{thumb_url}" width="800" style="border-radius:8px; border:1px solid #ccc;" /></a>'
+                      
+                      src_link = f'<a href="{src}" target="_blank">Source</a>' if src else "—"
+                      if fmt == "ZIP" and password:
+                          pwd_status = "🔒 Yes"
+                      elif fmt == "ZIP":
+                          pwd_status = "No"
+                      else:
+                          pwd_status = "—"
+                      rows.append((date, title, f"| {thumb_md} | {title} | {dur} | {size} | {fmt} | {date} | [Download]({raw_url}) | {src_link} | {pwd_status} |"))
+              def get_part_num(title):
+                  m = re.search(r'Part (\d+)', title)
+                  return int(m.group(1)) if m else 0
+              rows.sort(key=lambda x: (x[0], get_part_num(x[1])), reverse=True)
+
+          with open('Links.md', 'w', encoding='utf-8') as f:
+              f.write("## Direct Download Links\n\n")
+              f.write("> **Note:** Files larger than the split size have been split into multiple parts. Download all parts and open `.zip` file to extract.\n\n")
+              f.write("| Thumbnail | Title | Duration | Size | Format | Date | Download Link | Source URL | Password |\n")
+              f.write("|-----------|-------|----------|------|--------|------|---------------|------------|----------|\n")
+              for _, _, row in rows:
+                  f.write(row + "\n")
+          EOF
+        env:
+          PASSWORD: ${{ github.event.inputs.password }}
+
+      - name: Stop WARP container
+        if: always()
+        run: |
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Push changes
+        run: |
+          git config user.name "Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add dl/ thumb/ Links.md db.txt
+          git commit -m "Add downloads [skip ci]" || echo "No changes"
+          git push origin HEAD:${{ github.ref_name }}
