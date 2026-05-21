@@ -1,0 +1,131 @@
+name: Send to Bale (Safe with Retry)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    env:
+      BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+      BALE_CHAT_ID: ${{ secrets.BALE_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ارسال فایل‌ها با تأخیر و تلاش مجدد
+        if: env.BALE_BOT_TOKEN != '' && env.BALE_CHAT_ID != ''
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os, subprocess, glob, re, sys, time
+          from collections import defaultdict
+
+          BOT_TOKEN = os.environ['BALE_BOT_TOKEN']
+          CHAT_ID = int(os.environ['BALE_CHAT_ID'])
+
+          def send_with_retry(method, url, data, retries=3, delay=5):
+              for attempt in range(retries):
+                  result = subprocess.run(['curl', '-s', '-w', '%{http_code}', '-X', 'POST', url] + data, capture_output=True, text=True)
+                  http_code = result.stdout[-3:]
+                  if http_code == '200':
+                      return True
+                  print(f"تلاش {attempt+1} ناموفق (HTTP {http_code})، {delay} ثانیه بعد دوباره...")
+                  time.sleep(delay)
+              return False
+
+          meta_by_fname = {}
+          if os.path.exists('db.txt'):
+              with open('db.txt', 'r', encoding='utf-8') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line: continue
+                      parts = line.split('||')
+                      if len(parts) < 7: continue
+                      fname = parts[6]
+                      meta_by_fname[fname] = {
+                          'title': parts[0],
+                          'duration': parts[1],
+                          'size': parts[2],
+                          'thumb': parts[3],
+                          'format': parts[4],
+                          'date': parts[5],
+                          'src': parts[7] if len(parts) >= 8 else ''
+                      }
+
+          dl_folder = 'dl'
+          if not os.path.isdir(dl_folder) or not os.listdir(dl_folder):
+              print("هیچ فایلی در dl وجود ندارد")
+              sys.exit(0)
+
+          files = [f for f in os.listdir(dl_folder) if os.path.isfile(os.path.join(dl_folder, f))]
+
+          def find_thumbnail(base_name):
+              safe = re.sub(r'[^\w\-_.]', '_', base_name)
+              for pat in [f"thumb/{safe}.jpg", f"thumb/{safe}*.jpg", f"thumb/{base_name}.jpg", f"thumb/{base_name}*.jpg"]:
+                  matches = glob.glob(pat)
+                  if matches:
+                      return matches[0]
+              return None
+
+          groups = defaultdict(list)
+          for fname in files:
+              base = re.sub(r'\.(zip|z\d+)$', '', fname)
+              base = re.sub(r' - Part \d+$', '', base)
+              groups[base].append(fname)
+          for base in groups:
+              groups[base].sort(key=lambda x: (not x.endswith('.zip'), x))
+
+          for base, part_files in groups.items():
+              info = None
+              for f in part_files:
+                  if f in meta_by_fname:
+                      info = meta_by_fname[f]
+                      break
+              if not info:
+                  info = {'title': base, 'duration': 'نامشخص', 'size': 'نامشخص', 'thumb': '', 'format': 'نامشخص', 'date': 'نامشخص', 'src': ''}
+
+              duration, size = info['duration'], info['size']
+              if re.search(r'(MB|KB|GB)', str(duration)) and re.search(r'\d{1,2}:\d{2}', str(size)):
+                  duration, size = size, duration
+
+              if len(part_files) == 1:
+                  caption = f"📄 *{info['title']}*\n⏱️ مدت: {duration}\n📦 حجم: {size}\n🎞️ فرمت: {info['format']}\n📅 تاریخ دانلود: {info['date']}\n🔗 منبع: {info['src']}"
+              else:
+                  caption = f"📄 *{info['title']}* (چند قسمتی)\n⏱️ مدت: {duration}\n📦 حجم کل: {size}\n🎞️ فرمت: {info['format']}\n📅 تاریخ دانلود: {info['date']}\n🔗 منبع: {info['src']}\n\n⬇️ لطفاً تمام قسمت‌های زیر را دانلود کنید."
+
+              thumb_path = None
+              if info['thumb'] and os.path.exists(f"thumb/{info['thumb']}"):
+                  thumb_path = f"thumb/{info['thumb']}"
+              else:
+                  thumb_path = find_thumbnail(base)
+                  if not thumb_path and info['title']:
+                      thumb_path = find_thumbnail(info['title'])
+
+              if thumb_path and os.path.exists(thumb_path):
+                  print(f"ارسال تام‌نیل برای {base}")
+                  data = ['-F', f'chat_id={CHAT_ID}', '-F', f'photo=@{thumb_path}', '-F', f'caption={caption}', '-F', 'parse_mode=Markdown']
+                  send_with_retry('POST', f'https://tapi.bale.ai/bot{BOT_TOKEN}/sendPhoto', data)
+                  time.sleep(3)
+              else:
+                  if len(part_files) > 1:
+                      print(f"ارسال پیام متنی برای {base}")
+                      data = ['-F', f'chat_id={CHAT_ID}', '-F', f'text={caption}', '-F', 'parse_mode=Markdown']
+                      send_with_retry('POST', f'https://tapi.bale.ai/bot{BOT_TOKEN}/sendMessage', data)
+                      time.sleep(3)
+                  else:
+                      filepath = os.path.join(dl_folder, part_files[0])
+                      print(f"ارسال فایل {part_files[0]}")
+                      data = ['-F', f'chat_id={CHAT_ID}', '-F', f'document=@{filepath}', '-F', f'caption={caption}', '-F', 'parse_mode=Markdown']
+                      send_with_retry('POST', f'https://tapi.bale.ai/bot{BOT_TOKEN}/sendDocument', data)
+                      time.sleep(3)
+                      continue
+
+              if len(part_files) > 1:
+                  for fname in part_files:
+                      filepath = os.path.join(dl_folder, fname)
+                      print(f"ارسال قطعه: {fname}")
+                      data = ['-F', f'chat_id={CHAT_ID}', '-F', f'document=@{filepath}']
+                      send_with_retry('POST', f'https://tapi.bale.ai/bot{BOT_TOKEN}/sendDocument', data)
+                      time.sleep(3)
+
+          print("✅ ارسال با موفقیت انجام شد (حالت ایمن با تأخیر).")
+          PYTHON_SCRIPT
