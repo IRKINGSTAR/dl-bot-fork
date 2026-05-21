@@ -1,0 +1,7 @@
+## Direct Download Links
+
+> **Note:** Files larger than the split size have been split into multiple parts. Download all parts and open `.zip` file to extract.
+
+| Thumbnail | Title | Duration | Size | Format | Date | Download Link | Source URL | Password |
+|-----------|-------|----------|------|--------|------|---------------|------------|----------|
+| <a href="https://github.com/IRKINGSTAR/dl-bot-fork/raw/main/thumb/Hiphopologist_ft._Sogand_-_Marize_Ham__Official_Lyric_Video_.jpg" target="_blank"><img src="https://github.com/IRKINGSTAR/dl-bot-fork/raw/main/thumb/Hiphopologist_ft._Sogand_-_Marize_Ham__Official_Lyric_Video_.jpg" width="800" style="border-radius:8px; border:1px solid #ccc;" /></a> | Hiphopologist ft. Sogand - Marize Ham (Official Lyric Video) | 04:37 | 8MB | MP3 | 2026-05-21 11:17 | [Download](https://github.com/IRKINGSTAR/dl-bot-fork/raw/main/dl/Hiphopologist%20ft.%20Sogand%20-%20Marize%20Ham%20%28Official%20Lyric%20Video%29.mp3) | <a href="https://www.youtube.com/watch?v=ljMJcZJ6OyU&list=RDljMJcZJ6OyU&start_radio=1" target="_blank">Source</a> | — |
