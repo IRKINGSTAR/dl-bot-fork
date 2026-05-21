@@ -1,0 +1,80 @@
+name: Send to Bale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    env:
+      BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+      BALE_CHAT_ID: ${{ secrets.BALE_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ارسال فایل با متادیتا و تام‌نیل (بدون حذف)
+        if: env.BALE_BOT_TOKEN != '' && env.BALE_CHAT_ID != ''
+        run: |
+          if [ ! -d dl ] || [ -z "$(ls -A dl 2>/dev/null)" ]; then
+            echo "هیچ فایلی برای ارسال وجود ندارد."
+            exit 0
+          fi
+
+          for file in dl/*; do
+            [ -f "$file" ] || continue
+            fname=$(basename "$file")
+            echo "پردازش: $fname"
+
+            # خواندن متادیتا از db.txt (بدون تغییر)
+            record=$(grep -F "||$fname" db.txt 2>/dev/null | head -1)
+            if [ -n "$record" ]; then
+              title=$(echo "$record" | awk -F'\\|\\|' '{print $1}')
+              duration=$(echo "$record" | awk -F'\\|\\|' '{print $2}')
+              size=$(echo "$record" | awk -F'\\|\\|' '{print $3}')
+              thumb=$(echo "$record" | awk -F'\\|\\|' '{print $4}')
+              format=$(echo "$record" | awk -F'\\|\\|' '{print $5}')
+              date=$(echo "$record" | awk -F'\\|\\|' '{print $6}')
+              src=$(echo "$record" | awk -F'\\|\\|' '{print $8}')
+
+              # اصلاح خودکار جابجایی duration و size
+              if [[ "$duration" =~ (MB|KB|GB) ]] && [[ "$size" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]; then
+                tmp="$duration"; duration="$size"; size="$tmp"
+              fi
+
+              caption=$(printf "📄 *%s*\n⏱️ مدت: %s\n📦 حجم: %s\n🎞️ فرمت: %s\n📅 تاریخ دانلود: %s\n🔗 منبع: %s" \
+                "$fname" "${duration:-نامشخص}" "${size:-نامشخص}" "${format:-نامشخص}" "${date:-نامشخص}" "${src:-نامشخص}")
+
+              # پیدا کردن تام‌نیل
+              thumb_path=""
+              if [ -n "$thumb" ] && [ -f "thumb/$thumb" ]; then
+                thumb_path="thumb/$thumb"
+              else
+                base="${fname%.*}"
+                [ -f "thumb/$base.jpg" ] && thumb_path="thumb/$base.jpg"
+                [ -z "$thumb_path" ] && thumb_path=$(find thumb -maxdepth 1 -name "${base}*.jpg" -print -quit)
+              fi
+
+              if [ -n "$thumb_path" ] && [ -f "$thumb_path" ]; then
+                echo "ارسال تام‌نیل برای $fname"
+                curl -s -X POST "https://tapi.bale.ai/bot$BALE_BOT_TOKEN/sendPhoto" \
+                  -F "chat_id=$BALE_CHAT_ID" \
+                  -F "photo=@\"$thumb_path\"" \
+                  -F "caption=$caption" \
+                  -F "parse_mode=Markdown"
+              fi
+
+              echo "ارسال فایل $fname"
+              curl -s -X POST "https://tapi.bale.ai/bot$BALE_BOT_TOKEN/sendDocument" \
+                -F "chat_id=$BALE_CHAT_ID" \
+                -F "document=@\"$file\"" \
+                -F "caption=$caption" \
+                -F "parse_mode=Markdown"
+            else
+              echo "بدون متادیتا: $fname"
+              curl -s -X POST "https://tapi.bale.ai/bot$BALE_BOT_TOKEN/sendDocument" \
+                -F "chat_id=$BALE_CHAT_ID" \
+                -F "document=@\"$file\""
+            fi
+          done
+
+          echo "✅ ارسال با متادیتا و تام‌نیل کامل شد. فایل‌ها در مخزن باقی می‌مانند."
